@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+openai
+edge-tts
+gTTS
+numpy
+imageio-ffmpeg
