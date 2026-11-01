@@ -1,6 +1,6 @@
 """
 Relay server for the ESP32 eyes chatbot (Hindi + English).
-ESP32 mic audio (raw 16 kHz 16-bit mono) -> speech-to-text -> LLM -> edge-tts -> ffmpeg -> raw PCM back, X-Mood header.
+ESP32 mic audio (raw 16 kHz 16-bit mono) -> speech-to-text -> LLM -> edge-tts -> ffmpeg -> raw PCM streamed back, X-Mood header.
 """
 import asyncio
 import datetime
@@ -14,6 +14,7 @@ from openai import OpenAI
 import edge_tts
 import numpy as np
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 try:
     from faster_whisper import WhisperModel
 except ImportError:
@@ -101,7 +102,7 @@ def system_prompt() -> str:
         "Your words are spoken aloud through a speaker, so write exactly how a person would talk.\n"
         "- Reply ONLY in English or Hindi. If the person spoke Hindi or Hinglish, answer in Hindi written in "
         "Devanagari script; otherwise answer in English. Never use any other language.\n"
-        "- Keep it to one or two short sentences. No markdown, lists, emojis, URLs or symbols.\n"
+        "- Keep it to one short sentence, two at most. No markdown, lists, emojis, URLs or symbols.\n"
         "- Start every reply with exactly one mood tag in square brackets that fits the answer: "
         "[normal] [happy] [sad] [surprised] [angry] [tired] [love] [wink].\n"
         f"- Current date and time: {now}. The robot is in {LOCATION}."
@@ -133,7 +134,7 @@ def stt_call(audio: np.ndarray, language: str = "", verbose: bool = False):
 
 
 def transcribe_cloud(audio: np.ndarray) -> str:
-    if STT_LANG:                                          # language forced by you: no guessing
+    if STT_LANG:                                          # language forced by you: one call, no guessing
         return stt_call(audio, STT_LANG).text.strip()
     try:
         r = stt_call(audio, verbose=True)
@@ -172,7 +173,7 @@ def transcribe(pcm: bytes) -> str:
     peak = float(np.abs(audio).max())
     if peak < 0.005:
         return ""
-    audio *= min(0.9 / peak, 10.0)                       # normalise a quiet mic (capped: too much gain = noise)
+    audio *= min(0.9 / peak, 10.0)
 
     if USE_CLOUD_STT and STT_MODEL:
         try:
@@ -183,7 +184,7 @@ def transcribe(pcm: bytes) -> str:
     else:
         text = transcribe_local(audio)
     text = text.strip()
-    if not re.search(r"[A-Za-z\u0900-\u097F]", text):     # Korean/Chinese/symbols only = noise, ignore
+    if not re.search(r"[A-Za-z\u0900-\u097F]", text):
         print("Ignored non English/Hindi transcript:", repr(text))
         return ""
     return "" if text.lower() in HALLUCINATIONS else text
@@ -200,7 +201,7 @@ def ask_grok(user_text: str) -> tuple[str, str]:
         thinking = "gpt-oss" in GROK_MODEL
         kwargs = dict(
             model=GROK_MODEL,
-            max_tokens=800 if thinking else 250,
+            max_tokens=800 if thinking else 200,
             messages=[{"role": "system", "content": system_prompt()}] + history[-8:],
         )
         if thinking:
@@ -245,27 +246,66 @@ def gtts_mp3(text: str, lang: str) -> bytes:
     return buf.getvalue()
 
 
-async def synth(text: str) -> bytes:
-    hindi = bool(re.search(r"[\u0900-\u097F]", text))
-    mp3 = b""
-    try:
-        async for chunk in edge_tts.Communicate(text, VOICE_HI if hindi else VOICE_EN).stream():
-            if chunk["type"] == "audio":
-                mp3 += chunk["data"]
-    except Exception as e:
-        print("edge-tts failed:", e)
-    if not mp3 and gTTS is not None:
-        print("using backup voice (gTTS)")
-        mp3 = await asyncio.to_thread(gtts_mp3, text, "hi" if hindi else "en")
-    if not mp3:
-        return b""
+def ffmpeg_args():
+    return [ffmpeg_path(), "-loglevel", "error", "-i", "pipe:0",
+            "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1"]
+
+
+async def mp3_to_pcm(mp3: bytes) -> bytes:
     p = await asyncio.create_subprocess_exec(
-        ffmpeg_path(), "-loglevel", "error", "-i", "pipe:0",
-        "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-    )
+        *ffmpeg_args(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
     pcm, _ = await p.communicate(mp3)
     return pcm
+
+
+async def synth_stream(text: str):
+    """Yields raw PCM while the voice is still being generated (much faster first sound)."""
+    hindi = bool(re.search(r"[\u0900-\u097F]", text))
+    voice = VOICE_HI if hindi else VOICE_EN
+    p = await asyncio.create_subprocess_exec(
+        *ffmpeg_args(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+
+    async def feed():
+        try:
+            async for chunk in edge_tts.Communicate(text, voice).stream():
+                if chunk["type"] == "audio":
+                    p.stdin.write(chunk["data"])
+                    await p.stdin.drain()
+        except Exception as e:
+            print("edge-tts failed:", e)
+        finally:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+
+    feeder = asyncio.create_task(feed())
+    sent = False
+    try:
+        while True:
+            data = await p.stdout.read(4096)
+            if not data:
+                break
+            sent = True
+            yield data
+    finally:
+        feeder.cancel()
+        if p.returncode is None:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await p.wait()
+        except Exception:
+            pass
+
+    if not sent and gTTS is not None:                     # edge-tts gave nothing: backup voice
+        print("using backup voice (gTTS)")
+        mp3 = await asyncio.to_thread(gtts_mp3, text, "hi" if hindi else "en")
+        pcm = await mp3_to_pcm(mp3)
+        if pcm:
+            yield pcm
 
 
 @app.get("/health")
@@ -289,8 +329,20 @@ async def chat(request: Request):
 
     reply, mood = await asyncio.to_thread(ask_grok, text)
     print(f"Robot : [{mood}] {reply}   ({time.time() - t0:.1f}s)")
-    audio = await synth(clean_for_speech(reply))
-    print(f"Done in {time.time() - t0:.1f}s, {len(audio)} bytes")
-    if not audio:
+
+    stream = synth_stream(clean_for_speech(reply))
+    try:
+        first = await stream.__anext__()                  # wait only for the FIRST bit of audio
+    except StopAsyncIteration:
         return Response(status_code=500)
-    return Response(content=audio, media_type="application/octet-stream", headers={"X-Mood": mood})
+    print(f"First audio at {time.time() - t0:.1f}s")
+
+    async def body():
+        total = len(first)
+        yield first
+        async for c in stream:
+            total += len(c)
+            yield c
+        print(f"Done in {time.time() - t0:.1f}s, {total} bytes")
+
+    return StreamingResponse(body(), media_type="application/octet-stream", headers={"X-Mood": mood})
